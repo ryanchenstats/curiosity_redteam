@@ -34,6 +34,8 @@ import evaluate
 
 from accelerate_redteam_ppo_trainer import RedteamPPOConfig
 
+os.environ['HF_HOME'] = '/shares/bcs516/ryan/huggingface'
+
 script_name = os.path.splitext(os.path.basename(__file__))[0]
 
 def default_redteam_ppo_config():

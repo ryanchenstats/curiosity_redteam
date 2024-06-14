@@ -78,10 +78,17 @@ if __name__ == '__main__':
     # 32,
   ]
   
+  curiosity_bonus_coef = [
+    # 0.0,
+    1.0,
+  ]
+  
   seeds = [
     1000,
     2000,
     3000,
+    4000,
+    5000,
   ]
 
   all_job_args = []
@@ -94,6 +101,7 @@ if __name__ == '__main__':
           ent_reward_coef,
           textual_sim_reward_coef,
           target_sim_div_reward_coef,
+          curiosity_bonus_coef,
           batch_size,
           seed) in enumerate(
           sweep_with_devices(itertools.product(           
@@ -105,6 +113,7 @@ if __name__ == '__main__':
             ent_reward_coefs,
             textual_sim_reward_coefs,
             target_sim_div_reward_coefs,
+            curiosity_bonus_coef,
             batch_sizes,
             seeds),
             devices=launch_args.gpus,
@@ -132,6 +141,7 @@ if __name__ == '__main__':
           "method.bleu_reward_grams": "[2, 3, 4, 5]",
           "method.bleu_tokenizer": bleu_tokenizer[task_idx],
           "method.target_sim_div_reward_coef": target_sim_div_reward_coef[task_idx],
+          "method.curiosity_bonus_coef": curiosity_bonus_coef[task_idx],
           "train.logging_dir": logdir,
           "train.batch_size": batch_size[task_idx],
           "train.checkpoint_dir": logdir,

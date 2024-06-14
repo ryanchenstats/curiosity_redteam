@@ -93,6 +93,10 @@ from trlx.data.configs import (
 import pandas as pd
 
 from self_bleu import SelfBleuReward
+from forward_dynamics import ForwardDynamicsModel
+from inverse_dynamics import InverseDynamicsModel
+from embedders.embedders import *
+
 from sentence_embed import CosineSentenceEmbeddingReward
 
 from clean_reward import GiberishPenalty
@@ -128,10 +132,13 @@ class TextCSVLogger(object):
             "score": scores,
             "iter": self.iter_count,
         })        
+        str_df = str_df.replace('\|', '', regex=True)
+        if not os.path.exists(os.path.join(self.log_dir)):
+            os.makedirs(os.path.join(self.log_dir))
         str_df.to_csv(
             os.path.join(self.log_dir, self.output_filename),
             mode='w' if (self.iter_count == 0) else 'a', header=(self.iter_count == 0),
-            sep="\t")
+            sep="\t", escapechar='\\')
         self.iter_count += 1
 
 class TextCSVLoggerWithTimestamp(object):
@@ -163,7 +170,7 @@ class RedteamPPOConfig(PPOConfig):
     '''
     BLEU rewards configuration
     '''
-    bleu_reward_coef: float = -0.5 # NOTE: must be negative since we want to minimize overlap
+    bleu_reward_coef: float = 0, # -0.5 # NOTE: must be negative since we want to minimize overlap
     bleu_reward_grams: str = "[3, 4, 5]" # NOTE: accelerate tracker cannot log list arguments
     bleu_reward_include_prompts: bool = False # Including prompts in continuation tasks
     bleu_tokenizer: str = "nltk"
@@ -172,12 +179,12 @@ class RedteamPPOConfig(PPOConfig):
     '''
     Entropy bonus configuration (i.e., KL penalty to uniform distribution)
     '''
-    ent_reward_coef: float = 0.0
+    ent_reward_coef: float = 0.001
 
     '''
     Sentence embedding bonus
     '''
-    cossimemb_reward_coef: float = 0.0
+    cossimemb_reward_coef: float = 0 #1.0
     cossimemb_n_samples: int = -1
     cossimemb_impl: str = "huggingface"
     cossimemb_reward_include_prompts: bool = True
@@ -197,8 +204,14 @@ class RedteamPPOConfig(PPOConfig):
     '''
     GiberishPenalty
     '''
-    giberish_penalty_coef: float = 0.0
+    giberish_penalty_coef: float = 1.0
     giberish_model_device: str = "default" # same as attacker
+    
+    '''
+    Forward Dynamics Exploration Bonus
+    '''
+    curiosity_bonus_coef: float = 1.0
+    curiosity_bonus_model_device: str = "default" # same as attacker
     
     '''
     Reward model device
@@ -236,9 +249,17 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
             device=(self.accelerator.device if config.method.cossimemb_model_device == "default" else config.method.cossimemb_model_device)
         )
         
+        
         if self.config.method.giberish_penalty_coef != 0:
             self.giberish_penalty_penalty_module = GiberishPenalty((self.accelerator.device if config.method.giberish_model_device == "default" else config.method.giberish_model_device))
-    
+
+        if self.config.method.curiosity_bonus_coef != 0:
+            self.curiosity_bonus_df_module = InverseDynamicsModel(384, 
+                                                                  384, 
+                                                                  512, 
+                                                                  embedder=SentenceTransformerEmbedder(), 
+                                                                  device=self.accelerator.device if config.method.giberish_model_device == "default" else config.method.giberish_model_device)
+        
         self.train_text_logger = TextCSVLogger(self.accelerator.project_dir, "train.csv")
         self.eval_text_logger = TextCSVLogger(self.accelerator.project_dir, "eval.csv")
         self.history_scores = []
@@ -388,22 +409,23 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
         
         return mean_kl, mean_kl_per_token, rollout_count
 
-    def _aggregate_traj_reward(self, all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, device):
+    def _aggregate_traj_reward(self, all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, all_curiosity_bonus_scores, device):
         return [
             torch.tensor(score + 
                 self.config.method.bleu_reward_coef * bleu_score +
                 self.config.method.cossimemb_reward_coef * cossimemb_score +
                 self.config.method.textual_sim_reward_coef * textualsim_score + 
                 self.config.method.target_sim_div_reward_coef * target_sim_div_score +
-                self.config.method.giberish_penalty_coef * giberish_score
+                self.config.method.giberish_penalty_coef * giberish_score +
+                self.config.method.curiosity_bonus_coef * curiosity_score
                 , dtype=torch.float, device=device).view(
                 -1,
             )
-            for score, bleu_score, cossimemb_score, textualsim_score, target_sim_div_score, giberish_score in zip(
-                all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores)
+            for score, bleu_score, cossimemb_score, textualsim_score, target_sim_div_score, giberish_score, curiosity_score in zip(
+                all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, all_curiosity_bonus_scores)
         ]
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def make_experience(self, num_rollouts: int = 1024, iter_count: int = 0):  # noqa:
         """Make experiences
 
@@ -432,227 +454,244 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
         accumulated_stats = []
 
         while len(ppo_rl_elements) < num_rollouts:
-            stats = {}
-            # Get next batch in prompt dataset
-            batch: PromptBatch = next(self.prompt_iterator)
+            with torch.no_grad():
+                stats = {}
+                # Get next batch in prompt dataset
+                batch: PromptBatch = next(self.prompt_iterator)
 
-            rollout_generate_time = time()
+                rollout_generate_time = time()
 
-            # Generate samples from the language model (similar to using HuggingFace `generate` method)
-            attention_mask_arg = batch["attention_mask"] if batch["attention_mask"].shape[0] !=1 else None
-            samples = self.generate(batch["input_ids"], attention_mask_arg)
-            stats["time/rollout_generate"] = time() - rollout_generate_time
+                # Generate samples from the language model (similar to using HuggingFace `generate` method)
+                attention_mask_arg = batch["attention_mask"] if batch["attention_mask"].shape[0] !=1 else None
+                samples = self.generate(batch["input_ids"], attention_mask_arg)
+                stats["time/rollout_generate"] = time() - rollout_generate_time
 
-            prompt_tensors = batch.input_ids
-            device = samples.device
+                prompt_tensors = batch.input_ids
+                device = samples.device
 
-            prompt_sizes = torch.tensor([prompt_tensors.shape[1]] * len(prompt_tensors), device=device)
-            padded_samples = self.accelerator.pad_across_processes(
-                samples, dim=1, pad_index=self.tokenizer.eos_token_id, pad_first=False
-            )
-            padded_prompts = self.accelerator.pad_across_processes(
-                prompt_tensors, dim=1, pad_index=self.tokenizer.eos_token_id, pad_first=False
-            )
-            gathered_samples = self.accelerator.gather(padded_samples)
-            gathered_prompts = self.accelerator.gather(padded_prompts)
-            gathered_prompt_sizes = self.accelerator.gather(prompt_sizes)
-            metadata = gather_dict({k: v for k, v in batch.items() if k != "input_ids" and k != "attention_mask"})
-            
-            if self.accelerator.is_main_process:
-                all_str_samples, all_str_prompts, all_str_outputs = self.decode(
-                    gathered_prompts, gathered_samples, gathered_prompt_sizes, append_eos_token=True
+                prompt_sizes = torch.tensor([prompt_tensors.shape[1]] * len(prompt_tensors), device=device)
+                padded_samples = self.accelerator.pad_across_processes(
+                    samples, dim=1, pad_index=self.tokenizer.eos_token_id, pad_first=False
                 )
+                padded_prompts = self.accelerator.pad_across_processes(
+                    prompt_tensors, dim=1, pad_index=self.tokenizer.eos_token_id, pad_first=False
+                )
+                gathered_samples = self.accelerator.gather(padded_samples)
+                gathered_prompts = self.accelerator.gather(padded_prompts)
+                gathered_prompt_sizes = self.accelerator.gather(prompt_sizes)
+                metadata = gather_dict({k: v for k, v in batch.items() if k != "input_ids" and k != "attention_mask"})
                 
-                rollout_score_time = time()
-                # reward_fn should return list of rewards at each token per sample        
-                all_scores, all_str_victim_outputs = self.reward_fn(
-                            samples=all_str_samples, 
-                            prompts=all_str_prompts, 
-                            outputs=all_str_outputs,
-                            return_texts=True,
-                            **metadata)
-                """
-                Training logs: log all generated texts
-                """
-                self.train_text_logger.log(
-                    all_str_prompts, 
-                    all_str_outputs, 
-                    all_str_victim_outputs, # TODO: this can be a list of tuples
-                    all_scores)
-
-                """
-                Compute Self-BLEU rewards as diveristy penalty
-                  1. Compute Self-BLEU score for each generated response
-                  2. Update the references in Self-BLEU score 
-                """
-                if self.config.method.bleu_reward_coef == 0:
-                    all_bleu_scores = [0.] * len(all_scores)
-                else:
-                    if self.config.method.bleu_reward_include_prompts:
-                        all_bleu_scores = self.bleu_reward_module(all_str_samples)
-                        self.bleu_reward_module.append_reference(all_str_samples)
-                    else:
-                        all_bleu_scores = self.bleu_reward_module(all_str_outputs)
-                        self.bleu_reward_module.append_reference(all_str_outputs)
-
-                """
-                Compute SimEmd rewards as diversity penalty
-                """
-                if self.config.method.cossimemb_reward_coef == 0:
-                    all_cossimemb_scores = [0.] * len(all_scores)
-                else:
-                    if self.config.method.cossimemb_reward_include_prompts:
-                        all_cossimemb_scores = self.cossimemb_reward_module(all_str_samples)
-                        self.cossimemb_reward_module.append_reference(all_str_samples)
-                    else:
-                        all_cossimemb_scores = self.cossimemb_reward_module(all_str_outputs)
-                        self.cossimemb_reward_module.append_reference(all_str_outputs)
+                if self.accelerator.is_main_process:
+                    all_str_samples, all_str_prompts, all_str_outputs = self.decode(
+                        gathered_prompts, gathered_samples, gathered_prompt_sizes, append_eos_token=True
+                    )
                     
-                """
-                Compute similarity rewards
-                """
-                if self.config.method.textual_sim_reward_coef == 0:
-                    all_textualsim_scores = [0.] * len(all_scores)
-                else:
-                    if self.config.method.textual_sim_reward_include_prompts:
-                        all_textualsim_scores = self.cossimemb_reward_module.compute_similarity(
-                            all_str_prompts,
-                            all_str_samples)
+                    rollout_score_time = time()
+                    # reward_fn should return list of rewards at each token per sample        
+                    all_scores, all_str_victim_outputs = self.reward_fn(
+                                samples=all_str_samples, 
+                                prompts=all_str_prompts, 
+                                outputs=all_str_outputs,
+                                return_texts=True,
+                                **metadata)
+                    """
+                    Training logs: log all generated texts
+                    """
+                    self.train_text_logger.log(
+                        all_str_prompts, 
+                        all_str_outputs, 
+                        all_str_victim_outputs, # TODO: this can be a list of tuples
+                        all_scores)
+
+                    """
+                    Compute Self-BLEU rewards as diveristy penalty
+                    1. Compute Self-BLEU score for each generated response
+                    2. Update the references in Self-BLEU score 
+                    """
+                    if self.config.method.bleu_reward_coef == 0:
+                        all_bleu_scores = [0.] * len(all_scores)
                     else:
-                        all_textualsim_scores = self.cossimemb_reward_module.compute_similarity(
-                            all_str_prompts,
-                            all_str_outputs)
+                        if self.config.method.bleu_reward_include_prompts:
+                            all_bleu_scores = self.bleu_reward_module(all_str_samples)
+                            self.bleu_reward_module.append_reference(all_str_samples)
+                        else:
+                            all_bleu_scores = self.bleu_reward_module(all_str_outputs)
+                            self.bleu_reward_module.append_reference(all_str_outputs)
+
+                    """
+                    Compute SimEmd rewards as diversity penalty
+                    """
+                    if self.config.method.cossimemb_reward_coef == 0:
+                        all_cossimemb_scores = [0.] * len(all_scores)
+                    else:
+                        if self.config.method.cossimemb_reward_include_prompts:
+                            all_cossimemb_scores = self.cossimemb_reward_module(all_str_samples)
+                            self.cossimemb_reward_module.append_reference(all_str_samples)
+                        else:
+                            all_cossimemb_scores = self.cossimemb_reward_module(all_str_outputs)
+                            self.cossimemb_reward_module.append_reference(all_str_outputs)
                         
-                """
-                Compute target embedding diversity rewards
-                """
-                if self.config.method.target_sim_div_reward_coef == 0:
-                    all_target_sim_div_scores = [0.] * len(all_scores)
-                else:                    
-                    all_target_sim_div_scores = self.cossimemb_reward_module.compute_l1_div_rewards(
-                        all_str_victim_outputs)
+                    """
+                    Compute similarity rewards
+                    """
+                    if self.config.method.textual_sim_reward_coef == 0:
+                        all_textualsim_scores = [0.] * len(all_scores)
+                    else:
+                        if self.config.method.textual_sim_reward_include_prompts:
+                            all_textualsim_scores = self.cossimemb_reward_module.compute_similarity(
+                                all_str_prompts,
+                                all_str_samples)
+                        else:
+                            all_textualsim_scores = self.cossimemb_reward_module.compute_similarity(
+                                all_str_prompts,
+                                all_str_outputs)
+                            
+                    """
+                    Compute target embedding diversity rewards
+                    """
+                    if self.config.method.target_sim_div_reward_coef == 0:
+                        all_target_sim_div_scores = [0.] * len(all_scores)
+                    else:                    
+                        all_target_sim_div_scores = self.cossimemb_reward_module.compute_l1_div_rewards(
+                            all_str_victim_outputs)
+                        
                     
-                
-                """
-                Compute gibberish penalty
-                """                
-                if self.config.method.giberish_penalty_coef == 0:
-                    all_giberish_scores = [0.] * len(all_scores)
+                    """
+                    Compute gibberish penalty
+                    """                
+                    if self.config.method.giberish_penalty_coef == 0:
+                        all_giberish_scores = [0.] * len(all_scores)
+                    else:
+                        all_giberish_scores = self.giberish_penalty_penalty_module(all_str_outputs)
+                    
+                    
+                    """
+                    Compute forward dynamics
+                    """
+                    if self.config.method.curiosity_bonus_coef == 0:
+                        all_curiosity_bonus_scores = [0.] * len(all_scores)
+                    else:
+                        # print(all_str_samples, all_str_prompts, all_str_victim_outputs)
+                        with torch.set_grad_enabled(True):
+                            all_curiosity_bonus_scores = self.curiosity_bonus_df_module.train(all_str_samples, all_str_prompts, all_str_victim_outputs)   
+                            
+                    all_scores = self._aggregate_traj_reward(all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, all_curiosity_bonus_scores, device)
+                    
+                    # Pad 0 reward on the ends
+                    all_scores = pad_sequence(all_scores, batch_first=True, padding_value=-np.inf)
+                    max_len = torch.tensor(all_scores.shape[1], dtype=torch.long, device=device)
+
+                    stats["time/rollout_score"] = time() - rollout_score_time
+
+                    all_scores = list(all_scores.reshape(self.accelerator.num_processes, -1, max_len).unbind())
+                    self.history_scores += all_scores
                 else:
-                    all_giberish_scores = self.giberish_penalty_penalty_module(all_str_outputs)
-                                
-                all_scores = self._aggregate_traj_reward(all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, device)
+                    all_scores = None
+                    max_len = torch.tensor(0, dtype=torch.long, device=device)
+
+                if torch.distributed.is_initialized():
+                    torch.distributed.broadcast(max_len, 0)
+                    
+                    scores = torch.empty((len(samples), max_len), device=device)
+                    torch.distributed.scatter(scores, all_scores)
+                    
+                    bleu_scores = torch.empty((len(samples), max_len), device=device)
+                    torch.distributed.scatter(bleu_scores, all_bleu_scores)
+                    
+                    cossimemb_scores = torch.empty((len(samples), max_len), device=device)
+                    torch.distributed.scatter(cossimemb_scores, all_cossimemb_scores)
+                    
+                    textualsim_scores = torch.empty((len(samples), max_len), device=device)
+                    torch.distributed.scatter(textualsim_scores, all_textualsim_scores)
+                    
+                    targetsimdiv_scores = torch.empty((len(samples), max_len), device=device)
+                    torch.distributed.scatter(targetsimdiv_scores, all_target_sim_div_scores)
+                    
+                    giberish_scores = torch.empty((len(samples), max_len), device=device)
+                    torch.distributed.scatter(giberish_scores, all_giberish_scores)                
+                    
+                    curiosity_scores = torch.empty((len(samples), max_len), device=device)
+                    torch.distributed.scatter(curiosity_scores, all_curiosity_bonus_scores)      
+                    
+                else:
+                    scores = all_scores[0].clone().detach()
+                    bleu_scores = torch.tensor(all_bleu_scores).unsqueeze(1).clone().detach().to(scores.device)
+                    cossimemb_scores = torch.tensor(all_cossimemb_scores).unsqueeze(1).clone().detach().to(scores.device)              
+                    textualsim_scores = torch.tensor(all_textualsim_scores).unsqueeze(1).clone().detach().to(scores.device)
+                    targetsimdiv_scores = torch.tensor(all_target_sim_div_scores).unsqueeze(1).clone().detach().to(scores.device)
+                    giberish_scores = torch.tensor(all_giberish_scores).unsqueeze(1).clone().detach().to(scores.device)
+                    curiosity_scores = torch.tensor(all_curiosity_bonus_scores).unsqueeze(1).clone().detach().to(scores.device)
+                    
+                scores_mask = scores != -np.inf
+
+                str_samples, str_prompts, str_outputs = self.decode(prompt_tensors, samples, append_eos_token=True)
+
+                # Pad the sample outputs
+                outputs = self.tokenizer(str_outputs).input_ids
+                if self.config.model.model_arch_type == "seq2seq":
+                    # add <pad> to the start of the output
+                    for i in range(len(outputs)):
+                        outputs[i] = [self.tokenizer.pad_token_id] + outputs[i]
+
+                outputs = list(map(torch.LongTensor, outputs))
+                maxsize = max(map(len, outputs))
+                outputs = [
+                    F.pad(
+                        output,
+                        (0, maxsize - len(output)),
+                        value=self.tokenizer.pad_token_id,
+                    )
+                    for output in outputs
+                ]
+                sample_outputs = torch.vstack(outputs).to(device)
+
+                if self.config.method.cliprange_reward:
+                    scores = torch.clip(scores, -self.config.method.cliprange_reward, self.config.method.cliprange_reward)
+
+                # store statistics of the initial rollout as reference
+                if self.ref_mean is None:
+                    self.ref_mean, self.ref_std = (scores * scores_mask).sum(dim=1).mean(), (scores * scores_mask).sum(
+                        dim=1
+                    ).std()
+                all_scores_mean, all_scores_std = self.running_moments.update(torch.sum(scores * scores_mask, dim=1))
+                stats["rollout_scores/mean"] = all_scores_mean.item()
+                stats["rollout_scores/std"] = all_scores_std.item()
+                stats["rollout_scores/running_mean"] = self.running_moments.mean.item()
+                stats["rollout_scores/running_std"] = self.running_moments.std.item()
                 
-                # Pad 0 reward on the ends
-                all_scores = pad_sequence(all_scores, batch_first=True, padding_value=-np.inf)
-                max_len = torch.tensor(all_scores.shape[1], dtype=torch.long, device=device)
-
-                stats["time/rollout_score"] = time() - rollout_score_time
-
-                all_scores = list(all_scores.reshape(self.accelerator.num_processes, -1, max_len).unbind())
-                self.history_scores += all_scores
-            else:
-                all_scores = None
-                max_len = torch.tensor(0, dtype=torch.long, device=device)
-
-            if torch.distributed.is_initialized():
-                torch.distributed.broadcast(max_len, 0)
+                stats["rollout_bleu_scores/mean"] = (bleu_scores * scores_mask).mean().item()
+                stats["rollout_cossimemb_scores/mean"] = (cossimemb_scores * scores_mask).mean().item()
+                stats["rollout_textualsim_scores/mean"] = (textualsim_scores * scores_mask).mean().item()
+                stats["rollout_targetsimdiv_scores/mean"] = (targetsimdiv_scores * scores_mask).mean().item()
+                stats["rollout_giberish_scores/mean"] = (giberish_scores * scores_mask).mean().item()
                 
-                scores = torch.empty((len(samples), max_len), device=device)
-                torch.distributed.scatter(scores, all_scores)
-                
-                bleu_scores = torch.empty((len(samples), max_len), device=device)
-                torch.distributed.scatter(bleu_scores, all_bleu_scores)
-                
-                cossimemb_scores = torch.empty((len(samples), max_len), device=device)
-                torch.distributed.scatter(cossimemb_scores, all_cossimemb_scores)
-                
-                textualsim_scores = torch.empty((len(samples), max_len), device=device)
-                torch.distributed.scatter(textualsim_scores, all_textualsim_scores)
-                
-                targetsimdiv_scores = torch.empty((len(samples), max_len), device=device)
-                torch.distributed.scatter(targetsimdiv_scores, all_target_sim_div_scores)
-                
-                giberish_scores = torch.empty((len(samples), max_len), device=device)
-                torch.distributed.scatter(giberish_scores, all_giberish_scores)                
-            else:
-                scores = all_scores[0].clone().detach()
-                bleu_scores = torch.tensor(all_bleu_scores).unsqueeze(1).clone().detach().to(scores.device)
-                cossimemb_scores = torch.tensor(all_cossimemb_scores).unsqueeze(1).clone().detach().to(scores.device)              
-                textualsim_scores = torch.tensor(all_textualsim_scores).unsqueeze(1).clone().detach().to(scores.device)
-                targetsimdiv_scores = torch.tensor(all_target_sim_div_scores).unsqueeze(1).clone().detach().to(scores.device)
-                giberish_scores = torch.tensor(all_giberish_scores).unsqueeze(1).clone().detach().to(scores.device)
-                
-            scores_mask = scores != -np.inf
+                if self.config.method.scale_reward == "running":
+                    scores /= self.running_moments.std
+                elif self.config.method.scale_reward == "ref":
+                    scores /= self.ref_std
 
-            str_samples, str_prompts, str_outputs = self.decode(prompt_tensors, samples, append_eos_token=True)
+                mean_kl, mean_kl_per_token, rollout_count = self._process_element(
+                    ppo_rl_elements, samples, batch, prompt_tensors, sample_outputs, scores, scores_mask, device)
 
-            # Pad the sample outputs
-            outputs = self.tokenizer(str_outputs).input_ids
-            if self.config.model.model_arch_type == "seq2seq":
-                # add <pad> to the start of the output
-                for i in range(len(outputs)):
-                    outputs[i] = [self.tokenizer.pad_token_id] + outputs[i]
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(mean_kl, torch.distributed.ReduceOp.AVG)
 
-            outputs = list(map(torch.LongTensor, outputs))
-            maxsize = max(map(len, outputs))
-            outputs = [
-                F.pad(
-                    output,
-                    (0, maxsize - len(output)),
-                    value=self.tokenizer.pad_token_id,
-                )
-                for output in outputs
-            ]
-            sample_outputs = torch.vstack(outputs).to(device)
+                stats["time/rollout_time"] = clock.tick()
+                stats["policy/sqrt_kl"] = torch.sqrt(mean_kl).item()
+                stats["policy/kl_per_token"] = torch.sqrt(mean_kl_per_token).item()
+                accumulated_stats.append(stats)
 
-            if self.config.method.cliprange_reward:
-                scores = torch.clip(scores, -self.config.method.cliprange_reward, self.config.method.cliprange_reward)
+                tbar.set_description(f"[rollout {len(ppo_rl_elements)} / {num_rollouts}]")
+                tbar.update(min(rollout_count, num_rollouts))
+            tbar.close()
 
-            # store statistics of the initial rollout as reference
-            if self.ref_mean is None:
-                self.ref_mean, self.ref_std = (scores * scores_mask).sum(dim=1).mean(), (scores * scores_mask).sum(
-                    dim=1
-                ).std()
-            all_scores_mean, all_scores_std = self.running_moments.update(torch.sum(scores * scores_mask, dim=1))
-            stats["rollout_scores/mean"] = all_scores_mean.item()
-            stats["rollout_scores/std"] = all_scores_std.item()
-            stats["rollout_scores/running_mean"] = self.running_moments.mean.item()
-            stats["rollout_scores/running_std"] = self.running_moments.std.item()
-            
-            stats["rollout_bleu_scores/mean"] = (bleu_scores * scores_mask).mean().item()
-            stats["rollout_cossimemb_scores/mean"] = (cossimemb_scores * scores_mask).mean().item()
-            stats["rollout_textualsim_scores/mean"] = (textualsim_scores * scores_mask).mean().item()
-            stats["rollout_targetsimdiv_scores/mean"] = (targetsimdiv_scores * scores_mask).mean().item()
-            stats["rollout_giberish_scores/mean"] = (giberish_scores * scores_mask).mean().item()
-            
-            if self.config.method.scale_reward == "running":
-                scores /= self.running_moments.std
-            elif self.config.method.scale_reward == "ref":
-                scores /= self.ref_std
+            stats = {k: sum([xs[k] for xs in accumulated_stats]) / len(accumulated_stats) for k in stats}
+            stats["kl_ctl_value"] = self.kl_ctl.value
+            self.mean_kl = stats["policy/sqrt_kl"] ** 2
+            self.accelerator.log(stats, step=iter_count)
 
-            mean_kl, mean_kl_per_token, rollout_count = self._process_element(
-                ppo_rl_elements, samples, batch, prompt_tensors, sample_outputs, scores, scores_mask, device)
-
-            if torch.distributed.is_initialized():
-                torch.distributed.all_reduce(mean_kl, torch.distributed.ReduceOp.AVG)
-
-            stats["time/rollout_time"] = clock.tick()
-            stats["policy/sqrt_kl"] = torch.sqrt(mean_kl).item()
-            stats["policy/kl_per_token"] = torch.sqrt(mean_kl_per_token).item()
-            accumulated_stats.append(stats)
-
-            tbar.set_description(f"[rollout {len(ppo_rl_elements)} / {num_rollouts}]")
-            tbar.update(min(rollout_count, num_rollouts))
-        tbar.close()
-
-        stats = {k: sum([xs[k] for xs in accumulated_stats]) / len(accumulated_stats) for k in stats}
-        stats["kl_ctl_value"] = self.kl_ctl.value
-        self.mean_kl = stats["policy/sqrt_kl"] ** 2
-        self.accelerator.log(stats, step=iter_count)
-
-        # Push samples and rewards to trainer's rollout storage
-        self.push_to_store(ppo_rl_elements)
+            # Push samples and rewards to trainer's rollout storage
+            self.push_to_store(ppo_rl_elements)
 
     
     def evaluate(self):  # noqa: C901
@@ -797,6 +836,16 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
                         if not isinstance(rewards, list):
                             rewards = rewards.tolist()
                         columns_data.append(rewards)
+                        
+                        curiosity_bonus_in_eval = self.curiosity_bonus_df_module.eval_bonus(str_prompts, str_outputs, victim_str_outputs)
+                        
+                        if eval_batch_i == 0:
+                            columns.append('curiosity bonus')
+                        if not isinstance(rewards, list):
+                            curiosity_bonus_in_eval = curiosity_bonus_in_eval.tolist()
+                        columns_data.append(curiosity_bonus_in_eval)
+                        
+                        
                         stats[f"reward/mean{sweep_suffix}"] = mean_reward # TODO: only get the last one
                         # stats[f"reward/train/mean/{sweep_suffix}"] = np.mean(self.history_scores)
 

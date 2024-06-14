@@ -32,7 +32,10 @@ import evaluate
 
 from accelerate_redteam_ppo_trainer import RedteamPPOConfig
 
+os.environ['HF_HOME'] = '/shares/bcs516/ryan/huggingface'
+
 script_name = os.path.splitext(os.path.basename(__file__))[0]
+script_name = f'/home/rce5022/curiosity_redteam/reproduce/{script_name}'
 
 def default_redteam_ppo_config():
     return TRLConfig(
@@ -47,7 +50,9 @@ def default_redteam_ppo_config():
             trainer="AccelerateRedteamPPOTrainer",
             tracker="tensorboard",
             logging_dir=script_name,
-            checkpoint_dir=f"{script_name}/ckpts"
+            checkpoint_dir=f"{script_name}/ckpts",
+            save_best=False,
+            save_optimizer=False,
         ),
         model=ModelConfig(
             # model_path="vicgalle/gpt2-alpaca",
@@ -111,7 +116,7 @@ def default_redteam_ppo_config():
     )
 
 class RedTeamToxicityRewardModel(object):
-
+    # How toxic is the sample text?
     def __init__(self, device) -> None:
         self.toxicity_fn = evaluate.load(
                 "toxicity", 
@@ -194,3 +199,4 @@ def main(hparams={}):
 if __name__ == "__main__":
     hparams = {} if len(sys.argv) == 1 else json.loads(sys.argv[1])
     main(hparams)
+    
