@@ -95,6 +95,7 @@ import pandas as pd
 from self_bleu import SelfBleuReward
 from forward_dynamics import ForwardDynamicsModel
 from inverse_dynamics import InverseDynamicsModel
+from toxic_class import Diversity
 from embedders.embedders import *
 
 from sentence_embed import CosineSentenceEmbeddingReward
@@ -214,6 +215,12 @@ class RedteamPPOConfig(PPOConfig):
     curiosity_bonus_model_device: str = "default" # same as attacker
     
     '''
+    Toxicity Class Entropy
+    '''
+    toxic_class_coef: float = 0.0
+    toxic_class_model_device: str = "default" # same as attacker
+    
+    '''
     Reward model device
     '''
     reward_model_device_offset: int = 0
@@ -260,6 +267,9 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
                                                                   embedder=SentenceTransformerEmbedder(), 
                                                                   device=self.accelerator.device if config.method.giberish_model_device == "default" else config.method.giberish_model_device)
         
+        if self.config.method.toxic_classifier_coef != 0:
+            self.toxic_class_module = Diversity()
+            
         self.train_text_logger = TextCSVLogger(self.accelerator.project_dir, "train.csv")
         self.eval_text_logger = TextCSVLogger(self.accelerator.project_dir, "eval.csv")
         self.history_scores = []
@@ -409,7 +419,7 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
         
         return mean_kl, mean_kl_per_token, rollout_count
 
-    def _aggregate_traj_reward(self, all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, all_curiosity_bonus_scores, device):
+    def _aggregate_traj_reward(self, all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, all_curiosity_bonus_scores, all_toxic_class_scores, device):
         return [
             torch.tensor(score + 
                 self.config.method.bleu_reward_coef * bleu_score +
@@ -417,12 +427,13 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
                 self.config.method.textual_sim_reward_coef * textualsim_score + 
                 self.config.method.target_sim_div_reward_coef * target_sim_div_score +
                 self.config.method.giberish_penalty_coef * giberish_score +
-                self.config.method.curiosity_bonus_coef * curiosity_score
+                self.config.method.curiosity_bonus_coef * curiosity_score +
+                self.config.method.toxic_class_coef * toxic_class_score
                 , dtype=torch.float, device=device).view(
                 -1,
             )
-            for score, bleu_score, cossimemb_score, textualsim_score, target_sim_div_score, giberish_score, curiosity_score in zip(
-                all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, all_curiosity_bonus_scores)
+            for score, bleu_score, cossimemb_score, textualsim_score, target_sim_div_score, giberish_score, curiosity_score, toxic_class_score in zip(
+                all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, all_curiosity_bonus_scores, all_toxic_class_scores)
         ]
 
     # @torch.inference_mode()
@@ -574,8 +585,17 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
                         # print(all_str_samples, all_str_prompts, all_str_victim_outputs)
                         with torch.set_grad_enabled(True):
                             all_curiosity_bonus_scores = self.curiosity_bonus_df_module.train(all_str_samples, all_str_prompts, all_str_victim_outputs)   
-                            
-                    all_scores = self._aggregate_traj_reward(all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, all_curiosity_bonus_scores, device)
+                    
+                    """
+                    Compute toxic classifier
+                    """
+                    if self.config.method.toxic_class_coef == 0:
+                        all_toxic_class_scores = [0.] * len(all_scores)
+                    else:
+                        all_toxic_class_scores = self.toxic_class_module(all_str_victim_outputs)
+                        all_toxic_class_scores = [0.] * len(all_scores)
+                    
+                    all_scores = self._aggregate_traj_reward(all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, all_curiosity_bonus_scores, all_toxic_class_scores, device)
                     
                     # Pad 0 reward on the ends
                     all_scores = pad_sequence(all_scores, batch_first=True, padding_value=-np.inf)
@@ -611,7 +631,10 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
                     torch.distributed.scatter(giberish_scores, all_giberish_scores)                
                     
                     curiosity_scores = torch.empty((len(samples), max_len), device=device)
-                    torch.distributed.scatter(curiosity_scores, all_curiosity_bonus_scores)      
+                    torch.distributed.scatter(curiosity_scores, all_curiosity_bonus_scores)
+                    
+                    toxic_class_scores = torch.empty((len(samples), max_len), device=device)
+                    torch.distributed.scatter(toxic_class_scores, all_toxic_class_scores)
                     
                 else:
                     scores = all_scores[0].clone().detach()
@@ -621,6 +644,7 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
                     targetsimdiv_scores = torch.tensor(all_target_sim_div_scores).unsqueeze(1).clone().detach().to(scores.device)
                     giberish_scores = torch.tensor(all_giberish_scores).unsqueeze(1).clone().detach().to(scores.device)
                     curiosity_scores = torch.tensor(all_curiosity_bonus_scores).unsqueeze(1).clone().detach().to(scores.device)
+                    toxic_class_scores = torch.tensor(all_toxic_class_scores).unsqueeze(1).clone().detach().to(scores.device)
                     
                 scores_mask = scores != -np.inf
 
