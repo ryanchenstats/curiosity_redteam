@@ -1,3 +1,4 @@
+# python -m experiments.imdb_toxicity_response.run_ppo --mode local --gpus 0
 import contextlib
 import inspect
 import json
@@ -194,7 +195,7 @@ class RedteamPPOConfig(PPOConfig):
     '''
     Textual similarity reward (between attacker's prompts and attacker's responses)
     '''
-    textual_sim_reward_coef: float = 0.0
+    textual_sim_reward_coef: float = 1.0
     textual_sim_reward_include_prompts: bool = False
     
     '''
@@ -217,7 +218,7 @@ class RedteamPPOConfig(PPOConfig):
     '''
     Toxicity Class Entropy
     '''
-    toxic_class_coef: float = 0.0
+    toxic_class_coef: float = 1.0
     toxic_class_model_device: str = "default" # same as attacker
     
     '''
@@ -260,14 +261,14 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
         if self.config.method.giberish_penalty_coef != 0:
             self.giberish_penalty_penalty_module = GiberishPenalty((self.accelerator.device if config.method.giberish_model_device == "default" else config.method.giberish_model_device))
 
-        if self.config.method.curiosity_bonus_coef != 0:
-            self.curiosity_bonus_df_module = InverseDynamicsModel(384, 
+        # if self.config.method.curiosity_bonus_coef != 0:
+        self.curiosity_bonus_df_module = InverseDynamicsModel(384, 
                                                                   384, 
                                                                   512, 
                                                                   embedder=SentenceTransformerEmbedder(), 
                                                                   device=self.accelerator.device if config.method.giberish_model_device == "default" else config.method.giberish_model_device)
         
-        if self.config.method.toxic_classifier_coef != 0:
+        if self.config.method.toxic_class_coef != 0:
             self.toxic_class_module = Diversity()
             
         self.train_text_logger = TextCSVLogger(self.accelerator.project_dir, "train.csv")
@@ -593,7 +594,6 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
                         all_toxic_class_scores = [0.] * len(all_scores)
                     else:
                         all_toxic_class_scores = self.toxic_class_module(all_str_victim_outputs)
-                        all_toxic_class_scores = [0.] * len(all_scores)
                     
                     all_scores = self._aggregate_traj_reward(all_scores, all_bleu_scores, all_cossimemb_scores, all_textualsim_scores, all_target_sim_div_scores, all_giberish_scores, all_curiosity_bonus_scores, all_toxic_class_scores, device)
                     
@@ -643,8 +643,8 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
                     textualsim_scores = torch.tensor(all_textualsim_scores).unsqueeze(1).clone().detach().to(scores.device)
                     targetsimdiv_scores = torch.tensor(all_target_sim_div_scores).unsqueeze(1).clone().detach().to(scores.device)
                     giberish_scores = torch.tensor(all_giberish_scores).unsqueeze(1).clone().detach().to(scores.device)
-                    curiosity_scores = torch.tensor(all_curiosity_bonus_scores).unsqueeze(1).clone().detach().to(scores.device)
-                    toxic_class_scores = torch.tensor(all_toxic_class_scores).unsqueeze(1).clone().detach().to(scores.device)
+                    # curiosity_scores = torch.tensor(all_curiosity_bonus_scores).unsqueeze(1).clone().detach().to(scores.device)
+                    # toxic_class_scores = torch.tensor(all_toxic_class_scores).unsqueeze(1).clone().detach().to(scores.device)
                     
                 scores_mask = scores != -np.inf
 
@@ -861,13 +861,20 @@ class AccelerateRedteamPPOTrainer(AcceleratePPOTrainer):
                             rewards = rewards.tolist()
                         columns_data.append(rewards)
                         
-                        curiosity_bonus_in_eval = self.curiosity_bonus_df_module.eval_bonus(str_prompts, str_outputs, victim_str_outputs)
+                        curiosity_bonus_in_eval = self.curiosity_bonus_df_module.eval_bonus(str_prompts, victim_str_outputs)
+                        toxic_classifier_ent_in_eval = self.toxic_class_module(victim_str_outputs)
                         
                         if eval_batch_i == 0:
                             columns.append('curiosity bonus')
                         if not isinstance(rewards, list):
                             curiosity_bonus_in_eval = curiosity_bonus_in_eval.tolist()
                         columns_data.append(curiosity_bonus_in_eval)
+                        
+                        # if eval_batch_i == 0:
+                        #     columns.append('classifier ent')
+                        # if not isinstance(rewards, list):
+                        #     toxic_classifier_ent_in_eval = toxic_classifier_ent_in_eval.tolist()
+                        # columns_data.append(toxic_classifier_ent_in_eval)
                         
                         
                         stats[f"reward/mean{sweep_suffix}"] = mean_reward # TODO: only get the last one

@@ -64,13 +64,13 @@ if __name__ == '__main__':
   ]
   
   textual_sim_reward_coefs = [
-    # 1.0,
-    0,
+    1.0,
+    # 0,
   ]
   
   target_sim_div_reward_coefs = [
-    0.0,
-    # 1.0,
+    1.0,
+    #  1.0,
   ]
   
   batch_sizes = [
@@ -79,8 +79,12 @@ if __name__ == '__main__':
   ]
   
   curiosity_bonus_coef = [
-    # 0.0,
-    1.0,
+    0.0,
+    # 1.0,
+  ]
+  
+  toxic_classifier_coef = [
+    0.0,
   ]
   
   seeds = [

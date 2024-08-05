@@ -16,7 +16,7 @@ class InverseDynamicsModel(nn.Module):
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.model = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.Linear(state_dim + state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -24,7 +24,7 @@ class InverseDynamicsModel(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, state_dim)
+            nn.Linear(hidden_dim, action_dim)
         )
         self.embedder = embedder
         self.to(device=device)
@@ -36,8 +36,8 @@ class InverseDynamicsModel(nn.Module):
         state_embedding = self.embedder(state)
         next_state_embedding = self.embedder(next_state)
         x = torch.cat([state_embedding, next_state_embedding], dim=1)
-        next_state = self.model(x)
-        return next_state
+        action = self.model(x)
+        return action
     
     def train(self, state, action, next_state):
         self.optimizer.zero_grad()
@@ -56,13 +56,14 @@ class InverseDynamicsModel(nn.Module):
         self.optimizer.step()
         return per_state_loss
     
-    def eval_bonus(self, state, action, next_state):
+    def eval_bonus(self, state, next_state):
         with torch.no_grad():
             next_state_embedding = self.embedder(next_state)
             pred_next_state_embedding = self.forward(state, next_state)
             loss = self.criteria(pred_next_state_embedding, next_state_embedding)
             per_state_loss = torch.mean(loss, dim=-1)
             per_state_loss = per_state_loss / self.max_loss
+            per_state_loss[per_state_loss < 0.7] = per_state_loss[per_state_loss < 0.7] * -1
             
         return per_state_loss
 
